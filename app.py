@@ -1,0 +1,1113 @@
+import json
+import time
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+app = FastAPI(title="PigPlotter Live Stream Pipeline")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+connected_dashboards = set()
+latest_points = {}
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>PigPlotter Live Stream</title>
+    <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+    <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; background: #0f172a; font-weight: 600; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+
+        /* Marker Popup Styling (Bold & Bigger) */
+        .maplibregl-popup-content {
+            border-radius: 14px !important;
+            padding: 14px 16px !important;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.35) !important;
+        }
+        .popup-content {
+            font-size: 15px;
+            max-height: 280px;
+            overflow-y: auto;
+            line-height: 1.5;
+            min-width: 210px;
+            font-weight: 600;
+        }
+        .popup-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid #cbd5e1;
+            padding-bottom: 5px;
+            margin-bottom: 8px;
+        }
+        .popup-title {
+            font-size: 18px;
+            font-weight: 800;
+            color: #0f172a;
+            letter-spacing: 0.2px;
+            margin: 0;
+        }
+        .popup-age-badge {
+            font-size: 12px;
+            font-weight: 800;
+            padding: 2px 7px;
+            border-radius: 6px;
+            white-space: nowrap;
+        }
+        .popup-row {
+            margin-bottom: 4px;
+            word-break: break-word;
+            color: #1e293b;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .popup-key {
+            font-weight: 800;
+            color: #000000;
+            font-size: 14px;
+            margin-right: 4px;
+        }
+
+        /* Clean Top Status Banner */
+        .top-status-bar {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            right: 12px;
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: rgba(15, 23, 42, 0.88);
+            backdrop-filter: blur(12px);
+            padding: 8px 14px;
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.15);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+        }
+        .status-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+            cursor: pointer;
+        }
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #f59e0b;
+            flex-shrink: 0;
+            box-shadow: 0 0 10px #f59e0b;
+            transition: all 0.3s;
+        }
+        .status-dot.connected {
+            background: #10b981;
+            box-shadow: 0 0 10px #10b981;
+        }
+        .status-dot.error {
+            background: #ef4444;
+            box-shadow: 0 0 10px #ef4444;
+        }
+        .status-text {
+            font-size: 15px;
+            font-weight: 800;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            letter-spacing: 0.3px;
+            color: #f8fafc;
+        }
+        .status-sub {
+            font-size: 12px;
+            color: #cbd5e1;
+            display: block;
+            font-weight: 600;
+        }
+
+        /* Bottom Controls Dock (Views & Actions at Bottom) */
+        .bottom-dock {
+            position: absolute;
+            bottom: 14px;
+            left: 10px;
+            right: 10px;
+            z-index: 12;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            pointer-events: none;
+        }
+
+        /* Bottom View Switcher Row */
+        .bottom-view-bar {
+            pointer-events: auto;
+            display: flex;
+            justify-content: center;
+            gap: 6px;
+            background: rgba(15, 23, 42, 0.92);
+            backdrop-filter: blur(14px);
+            padding: 5px 8px;
+            border-radius: 30px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.45);
+            border: 1px solid rgba(255,255,255,0.15);
+            overflow-x: auto;
+        }
+        .view-btn {
+            background: transparent;
+            color: #cbd5e1;
+            border: 1px solid transparent;
+            border-radius: 20px;
+            padding: 7px 13px;
+            font-size: 13.5px;
+            font-weight: 700;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: all 0.15s;
+            user-select: none;
+        }
+        .view-btn:active {
+            transform: scale(0.96);
+        }
+        .view-btn.active {
+            background: #e63946;
+            color: #ffffff;
+            border-color: #ff5e6c;
+            box-shadow: 0 2px 10px rgba(230, 57, 70, 0.45);
+        }
+
+        /* Bottom Main Action Bar */
+        .bottom-action-bar {
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+            background: rgba(15, 23, 42, 0.94);
+            backdrop-filter: blur(16px);
+            padding: 8px 10px;
+            border-radius: 16px;
+            box-shadow: 0 6px 24px rgba(0,0,0,0.55);
+            border: 1px solid rgba(255,255,255,0.18);
+        }
+        .action-btn {
+            flex: 1;
+            background: rgba(255,255,255,0.12);
+            color: #f8fafc;
+            border: 1px solid rgba(255,255,255,0.18);
+            border-radius: 10px;
+            padding: 9px 8px;
+            font-size: 13.5px;
+            font-weight: 700;
+            cursor: pointer;
+            text-align: center;
+            white-space: nowrap;
+            transition: all 0.15s, transform 0.1s;
+            user-select: none;
+            letter-spacing: 0.2px;
+        }
+        .action-btn:active {
+            transform: scale(0.96);
+        }
+        .action-btn.active {
+            background: #e63946;
+            border-color: #e63946;
+        }
+        .action-btn.highlight {
+            background: #e63946;
+            border-color: #ff5e6c;
+            box-shadow: 0 0 12px rgba(230, 57, 70, 0.5);
+        }
+        .action-btn.sound-pulse {
+            animation: pulse-border 0.4s ease-out;
+        }
+
+        @keyframes pulse-border {
+            0% { box-shadow: 0 0 0 0 rgba(230, 57, 70, 0.9); }
+            100% { box-shadow: 0 0 0 16px rgba(230, 57, 70, 0); }
+        }
+
+        /* Plot Points List Overlay Modal / Drawer (Anchored Above Bottom Dock) */
+        .points-overlay {
+            position: absolute;
+            bottom: 116px;
+            left: 10px;
+            right: 10px;
+            max-height: calc(100vh - 180px);
+            background: rgba(15, 23, 42, 0.96);
+            backdrop-filter: blur(18px);
+            color: #f8fafc;
+            border-radius: 18px;
+            z-index: 20;
+            padding: 16px;
+            display: none;
+            flex-direction: column;
+            box-shadow: 0 16px 40px rgba(0,0,0,0.7);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        .points-overlay.open {
+            display: flex;
+        }
+        .overlay-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 12px;
+            border-bottom: 1px solid rgba(255,255,255,0.15);
+            margin-bottom: 12px;
+        }
+        .overlay-title {
+            font-size: 17px;
+            font-weight: 800;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            letter-spacing: 0.2px;
+        }
+        .overlay-search {
+            width: 100%;
+            background: #0f172a;
+            border: 1px solid #475569;
+            color: #f8fafc;
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-size: 14.5px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            outline: none;
+        }
+        .overlay-search:focus {
+            border-color: #e63946;
+            box-shadow: 0 0 8px rgba(230, 57, 70, 0.35);
+        }
+        .points-scroll-list {
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding-right: 4px;
+            max-height: calc(100vh - 270px);
+        }
+        .point-card {
+            background: rgba(30, 41, 59, 0.85);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 12px;
+            padding: 12px 14px;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s;
+        }
+        .point-card:hover, .point-card:active {
+            background: rgba(51, 65, 85, 0.95);
+            border-color: #e63946;
+        }
+        .point-card-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+        .point-card-id {
+            font-size: 16px;
+            font-weight: 800;
+            color: #f8fafc;
+            letter-spacing: 0.3px;
+        }
+        .point-card-coords {
+            font-size: 13.5px;
+            color: #cbd5e1;
+            font-family: ui-monospace, monospace;
+            font-weight: 700;
+        }
+        .point-card-details {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px dashed rgba(255,255,255,0.16);
+            font-size: 14px;
+            font-weight: 600;
+            line-height: 1.6;
+            color: #e2e8f0;
+            display: none;
+        }
+        .point-card-details.expanded {
+            display: block;
+        }
+        .detail-badge {
+            display: inline-block;
+            border-radius: 7px;
+            padding: 3px 8px;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        .point-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .point-action-btn {
+            background: rgba(255,255,255,0.12);
+            color: #f8fafc;
+            border: 1px solid rgba(255,255,255,0.16);
+            border-radius: 8px;
+            padding: 6px 12px;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .point-action-btn:hover, .point-action-btn:active {
+            background: #e63946;
+            border-color: #e63946;
+        }
+
+        /* Standard Modals (Bold & Bigger) */
+        .modal-backdrop {
+            position: absolute;
+            inset: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 30;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+        }
+        .modal-backdrop.open { display: flex; }
+        .modal {
+            background: #1e293b;
+            color: #f8fafc;
+            width: 100%;
+            max-width: 400px;
+            border-radius: 16px;
+            padding: 18px 20px;
+            box-shadow: 0 12px 36px rgba(0,0,0,0.6);
+            border: 1px solid rgba(255,255,255,0.16);
+        }
+        .modal h4 {
+            margin: 0 0 14px 0;
+            font-size: 17px;
+            font-weight: 800;
+            letter-spacing: 0.2px;
+        }
+        .modal label {
+            display: block;
+            font-size: 14px;
+            font-weight: 700;
+            color: #f1f5f9;
+            margin-bottom: 6px;
+        }
+        .modal input, .modal textarea, .modal select {
+            width: 100%;
+            background: #0f172a;
+            border: 1px solid #475569;
+            color: #f8fafc;
+            border-radius: 10px;
+            padding: 10px 12px;
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            font-family: inherit;
+        }
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 8px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Top Status Bar -->
+    <div class="top-status-bar">
+        <div class="status-group" onclick="togglePointsOverlay()">
+            <div id="statusDot" class="status-dot"></div>
+            <div>
+                <div class="status-text" id="statusTitle">PigPlotter Live</div>
+                <span class="status-sub" id="statusSub">Connecting...</span>
+            </div>
+        </div>
+        <div style="font-size:12px;color:#94a3b8;font-weight:700;" id="connectionMeta">MapTiler • OSM</div>
+    </div>
+
+    <!-- Plot Points List Overlay (Slides up above bottom controls) -->
+    <div id="pointsOverlay" class="points-overlay">
+        <div class="overlay-header">
+            <div class="overlay-title">
+                <span>📍 Plot Points</span>
+                <span id="overlayBadge" class="detail-badge" style="background:rgba(230,57,70,0.25);color:#ff5e6c;border:1px solid rgba(230,57,70,0.4);">0 points</span>
+            </div>
+            <button class="action-btn" style="flex:none;padding:5px 12px;" onclick="togglePointsOverlay()">✕ Close</button>
+        </div>
+        <input id="pointsSearchInput" class="overlay-search" type="text" placeholder="🔍 Search by ID or details..." oninput="renderPointsList()" />
+        <div id="pointsListContainer" class="points-scroll-list">
+            <div style="font-size:14px;color:#94a3b8;padding:20px 0;text-align:center;font-weight:600;">
+                No plot points on map yet.<br/>Waiting for pipeline telemetry...
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom Controls Dock (View Bar + Action Bar) -->
+    <div class="bottom-dock">
+        <!-- View Switcher Bar at Bottom -->
+        <div class="bottom-view-bar">
+            <button id="viewBtn-satellite" class="view-btn active" onclick="setMapStyle('satellite')">🛰️ Satellite</button>
+            <button id="viewBtn-streets" class="view-btn" onclick="setMapStyle('streets')">🗺️ Streets</button>
+            <button id="viewBtn-outdoor" class="view-btn" onclick="setMapStyle('outdoor')">⛰️ Terrain</button>
+            <button id="viewBtn-dark" class="view-btn" onclick="setMapStyle('dark')">🌙 Dark</button>
+        </div>
+
+        <!-- Main Actions Bar at Bottom -->
+        <div class="bottom-action-bar">
+            <button id="btnPoints" class="action-btn highlight" onclick="togglePointsOverlay()">📍 Points (0)</button>
+            <button id="btnFollow" class="action-btn active" onclick="toggleFollow()">🎯 Follow</button>
+            <button class="action-btn" onclick="openPipeModal()">➕ Pipe</button>
+            <button class="action-btn" style="flex:0.6;" onclick="openSettingsModal()">⚙</button>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal-backdrop">
+        <div class="modal">
+            <h4>Pipeline &amp; Display Settings</h4>
+            <label>Map Style (MapTiler)</label>
+            <select id="mapStyleSelect">
+                <option value="satellite">🛰️ Satellite Hybrid (MapTiler)</option>
+                <option value="streets">🗺️ Streets v2 (MapTiler)</option>
+                <option value="outdoor">⛰️ Terrain / Outdoor (MapTiler)</option>
+                <option value="dark">🌙 Dark Mode (MapTiler)</option>
+            </select>
+            <label>Base Server URL (HTTPS / HTTP)</label>
+            <input id="serverUrlInput" type="text" placeholder="https://pigplotter.duckdns.org" />
+            <div class="modal-actions">
+                <button class="action-btn" style="flex:none;padding:8px 14px;" onclick="closeModals()">Cancel</button>
+                <button class="action-btn active" style="flex:none;padding:8px 14px;" onclick="saveServerUrl()">Save Settings</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Push Pipe Payload Modal -->
+    <div id="pipeModal" class="modal-backdrop">
+        <div class="modal">
+            <h4>Push Plot Point to /pipe</h4>
+            <label>JSON Payload</label>
+            <textarea id="pipePayloadInput" rows="7">{
+  "id": "orin-nano-01",
+  "lat": 36.7378,
+  "lon": -119.7871,
+  "status": "Active",
+  "confidence": 0.94,
+  "notes": "Live plot point via NPM"
+}</textarea>
+            <div class="modal-actions">
+                <button class="action-btn" style="flex:none;padding:8px 12px;" onclick="fillDeviceGps()">Use Phone GPS</button>
+                <button class="action-btn" style="flex:none;padding:8px 12px;" onclick="closeModals()">Cancel</button>
+                <button class="action-btn active" style="flex:none;padding:8px 12px;" onclick="sendPipePayload()">POST /pipe</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script>
+        const DEFAULT_BASE_URL = "https://pigplotter.duckdns.org";
+        const MAPTILER_KEY = "y1BVVGaTua5i22ceEgRF";
+
+        // Pin aging steps (Matches backend: Red -> Amber -> Gray)
+        const PIN_AGE_STEPS = [
+            { maxAge: 2 * 60, color: '#e63946', label: 'Fresh (<2m)' },
+            { maxAge: 10 * 60, color: '#f59e0b', label: 'Recent (<10m)' },
+            { maxAge: Infinity, color: '#6b7280', label: 'Older (>10m)' }
+        ];
+
+        function pinColor(ts) {
+            if (!ts) return '#e63946';
+            const age = Math.max(0, (Date.now() / 1000) - ts);
+            for (const step of PIN_AGE_STEPS) {
+                if (age < step.maxAge) return step.color;
+            }
+            return '#6b7280';
+        }
+
+        function applyPinColor(marker, ts) {
+            if (!marker) return;
+            const el = marker.getElement();
+            if (!el) return;
+            const path = el.querySelector('path');
+            if (path) {
+                path.setAttribute('fill', pinColor(ts));
+            }
+        }
+
+        function formatAge(ts) {
+            if (!ts) return "Just now";
+            const sec = Math.max(0, Math.floor((Date.now() / 1000) - ts));
+            if (sec < 60) return `${sec}s ago`;
+            const min = Math.floor(sec / 60);
+            if (min < 60) return `${min}m ago`;
+            const hr = Math.floor(min / 60);
+            if (hr < 24) return `${hr}h ago`;
+            const days = Math.floor(hr / 24);
+            return `${days}d ago`;
+        }
+
+        // Dart throw audio
+        const DART_SOUND_B64 = "data:audio/mp3;base64,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";
+        let dartAudio = null;
+        try {
+            dartAudio = new Audio(DART_SOUND_B64);
+            dartAudio.preload = "auto";
+        } catch(e) {
+            console.warn("HTML5 audio setup:", e);
+        }
+
+        function playDartSound() {
+            if (window.AndroidBridge && window.AndroidBridge.playPlotSound) {
+                try {
+                    window.AndroidBridge.playPlotSound();
+                    return;
+                } catch (e) {}
+            }
+            if (dartAudio) {
+                try {
+                    dartAudio.currentTime = 0;
+                    dartAudio.play().catch(e => console.log("Audio play notice:", e));
+                } catch (e) {}
+            }
+        }
+
+        function getBaseUrl() {
+            if (window.AndroidBridge && window.AndroidBridge.getServerUrl) {
+                return window.AndroidBridge.getServerUrl() || DEFAULT_BASE_URL;
+            }
+            return localStorage.getItem("pigplotter_base_url") || DEFAULT_BASE_URL;
+        }
+
+        const MAP_STYLES = {
+            satellite: {
+                name: "🛰️ Satellite",
+                url: `https://api.maptiler.com/maps/hybrid/style.json?key=${MAPTILER_KEY}`
+            },
+            streets: {
+                name: "🗺️ Streets",
+                url: `https://api.maptiler.com/maps/streets-v2/style.json?key=${MAPTILER_KEY}`
+            },
+            outdoor: {
+                name: "⛰️ Terrain",
+                url: `https://api.maptiler.com/maps/outdoor-v2/style.json?key=${MAPTILER_KEY}`
+            },
+            dark: {
+                name: "🌙 Dark",
+                url: `https://api.maptiler.com/maps/dataviz-dark/style.json?key=${MAPTILER_KEY}`
+            }
+        };
+
+        let currentStyleKey = localStorage.getItem("pigplotter_map_style") || "satellite";
+
+        const map = new maplibregl.Map({
+            container: 'map',
+            style: MAP_STYLES[currentStyleKey].url,
+            center: [-119.7871, 36.7378],
+            zoom: 13
+        });
+
+        map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+        // Markers dictionary stores: { marker, ts }
+        const mapMarkers = {};
+        const latestPayloads = {};
+        const expandedCards = new Set();
+        let autoFollow = true;
+        let activeSocket = null;
+        let reconnectTimer = null;
+
+        function refreshPinAges() {
+            for (const entry of Object.values(mapMarkers)) {
+                if (entry && entry.marker && entry.ts) {
+                    applyPinColor(entry.marker, entry.ts);
+                }
+            }
+            renderPointsList();
+        }
+
+        // Periodically refresh pin ages every 10 seconds
+        setInterval(refreshPinAges, 10000);
+
+        function setMapStyle(key) {
+            if (!MAP_STYLES[key]) key = "satellite";
+            currentStyleKey = key;
+            localStorage.setItem("pigplotter_map_style", key);
+            map.setStyle(MAP_STYLES[key].url);
+
+            // Re-apply pin colors after style reload
+            map.once('style.load', () => {
+                refreshPinAges();
+            });
+
+            document.querySelectorAll('.view-btn').forEach(btn => btn.classList.remove('active'));
+            const activeBtn = document.getElementById('viewBtn-' + key);
+            if (activeBtn) activeBtn.classList.add('active');
+
+            const sel = document.getElementById("mapStyleSelect");
+            if (sel) sel.value = key;
+        }
+
+        function escapeHtml(str) {
+            return String(str)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;");
+        }
+
+        function generateDetailsHtml(id, payload, ts) {
+            const ageColor = pinColor(ts);
+            const ageText = formatAge(ts);
+
+            let html = `<div class="popup-content">
+                <div class="popup-header">
+                    <span class="popup-title">${escapeHtml(id)}</span>
+                    <span class="popup-age-badge" style="background:${ageColor}25;color:${ageColor};border:1px solid ${ageColor}50;">${ageText}</span>
+                </div>`;
+            for (const [key, value] of Object.entries(payload || {})) {
+                if (key === 'ts') continue;
+                const formattedVal = (typeof value === 'object' && value !== null)
+                    ? JSON.stringify(value)
+                    : value;
+                html += `<div class="popup-row"><span class="popup-key">${escapeHtml(key)}:</span> ${escapeHtml(formattedVal)}</div>`;
+            }
+            html += '</div>';
+            return html;
+        }
+
+        function upsertMarker(msg, panTo = true) {
+            if (!msg || msg.lat === undefined || msg.lon === undefined) return;
+            const marker_id = String(msg.marker_id || "node_default");
+            const lat = Number(msg.lat);
+            const lon = Number(msg.lon);
+            const full_payload = msg.full_payload || msg;
+            const ts = Number(msg.ts) || Number(full_payload?.ts) || (Date.now() / 1000);
+
+            if (Number.isNaN(lat) || Number.isNaN(lon)) return;
+
+            // Trigger dart throw sound
+            playDartSound();
+
+            // Flash bottom action button
+            const btnPoints = document.getElementById("btnPoints");
+            if (btnPoints) {
+                btnPoints.classList.remove("sound-pulse");
+                void btnPoints.offsetWidth;
+                btnPoints.classList.add("sound-pulse");
+            }
+
+            const htmlDetails = generateDetailsHtml(marker_id, full_payload, ts);
+            latestPayloads[marker_id] = { marker_id, lat, lon, ts, full_payload };
+
+            let entry = mapMarkers[marker_id];
+            if (entry) {
+                entry.marker.setLngLat([lon, lat]);
+                entry.marker.getPopup().setHTML(htmlDetails);
+                entry.ts = ts;
+            } else {
+                const popup = new maplibregl.Popup({ offset: 25 }).setHTML(htmlDetails);
+                const marker = new maplibregl.Marker({ color: pinColor(ts) })
+                    .setLngLat([lon, lat])
+                    .setPopup(popup)
+                    .addTo(map);
+                entry = { marker, ts };
+                mapMarkers[marker_id] = entry;
+            }
+
+            applyPinColor(entry.marker, entry.ts);
+
+            if (panTo && autoFollow) {
+                map.flyTo({ center: [lon, lat], speed: 0.9 });
+            }
+
+            renderPointsList();
+        }
+
+        function togglePointsOverlay() {
+            const overlay = document.getElementById("pointsOverlay");
+            overlay.classList.toggle("open");
+            if (overlay.classList.contains("open")) {
+                renderPointsList();
+            }
+        }
+
+        function toggleCardDetails(event, id) {
+            event.stopPropagation();
+            if (expandedCards.has(id)) {
+                expandedCards.delete(id);
+            } else {
+                expandedCards.add(id);
+            }
+            renderPointsList();
+        }
+
+        function focusPoint(id) {
+            const item = latestPayloads[id];
+            if (!item) return;
+
+            map.flyTo({
+                center: [item.lon, item.lat],
+                zoom: Math.max(map.getZoom(), 15),
+                speed: 1.2
+            });
+
+            const entry = mapMarkers[id];
+            if (entry && entry.marker) {
+                if (!entry.marker.getPopup().isOpen()) {
+                    entry.marker.togglePopup();
+                }
+            }
+
+            expandedCards.add(id);
+            renderPointsList();
+
+            if (window.innerWidth < 640) {
+                document.getElementById("pointsOverlay").classList.remove("open");
+            }
+        }
+
+        function renderPointsList() {
+            const ids = Object.keys(latestPayloads);
+            const totalCount = ids.length;
+
+            const btnPoints = document.getElementById("btnPoints");
+            if (btnPoints) btnPoints.textContent = `📍 Points (${totalCount})`;
+
+            const badge = document.getElementById("overlayBadge");
+            if (badge) badge.textContent = `${totalCount} points`;
+
+            const search = (document.getElementById("pointsSearchInput")?.value || "").toLowerCase().trim();
+            const container = document.getElementById("pointsListContainer");
+            if (!container) return;
+
+            if (totalCount === 0) {
+                container.innerHTML = `<div style="font-size:14px;color:#94a3b8;padding:20px 0;text-align:center;font-weight:600;">
+                    No plot points received yet.<br/>Push to <code>/pipe</code> to see points appear here!
+                </div>`;
+                return;
+            }
+
+            const filteredIds = ids.filter(id => {
+                if (!search) return true;
+                if (id.toLowerCase().includes(search)) return true;
+                const pl = latestPayloads[id].full_payload;
+                return JSON.stringify(pl).toLowerCase().includes(search);
+            });
+
+            if (filteredIds.length === 0) {
+                container.innerHTML = `<div style="font-size:14px;color:#94a3b8;padding:16px 0;text-align:center;font-weight:600;">
+                    No plot points match "<strong>${escapeHtml(search)}</strong>"
+                </div>`;
+                return;
+            }
+
+            container.innerHTML = filteredIds.map(id => {
+                const item = latestPayloads[id];
+                const isExpanded = expandedCards.has(id);
+                const payload = item.full_payload || {};
+                const ageColor = pinColor(item.ts);
+                const ageText = formatAge(item.ts);
+
+                let detailsRows = "";
+                for (const [k, v] of Object.entries(payload)) {
+                    const val = (typeof v === 'object' && v !== null) ? JSON.stringify(v) : v;
+                    detailsRows += `<div style="margin-bottom:5px;word-break:break-word;font-size:14px;">
+                        <strong style="color:#ffffff;font-weight:800;">${escapeHtml(k)}:</strong> <span style="color:#e2e8f0;font-weight:600;">${escapeHtml(val)}</span>
+                    </div>`;
+                }
+
+                return `
+                <div class="point-card" onclick="focusPoint('${escapeHtml(id)}')">
+                    <div class="point-card-top">
+                        <span class="point-card-id" style="display:flex;align-items:center;gap:6px;">
+                            <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${ageColor};box-shadow:0 0 8px ${ageColor};"></span>
+                            ${escapeHtml(id)}
+                        </span>
+                        <span class="detail-badge" style="background:${ageColor}25;color:${ageColor};border:1px solid ${ageColor}50;">
+                            ${ageText}
+                        </span>
+                    </div>
+                    <div class="point-card-coords">${item.lat.toFixed(5)}, ${item.lon.toFixed(5)}</div>
+                    <div class="point-actions">
+                        <button class="point-action-btn" onclick="focusPoint('${escapeHtml(id)}')">🎯 Focus Pin</button>
+                        <button class="point-action-btn" onclick="toggleCardDetails(event, '${escapeHtml(id)}')">
+                            ${isExpanded ? '▲ Hide Details' : '▼ Show Details'}
+                        </button>
+                    </div>
+                    <div class="point-card-details ${isExpanded ? 'expanded' : ''}">
+                        ${detailsRows}
+                    </div>
+                </div>`;
+            }).join("");
+        }
+
+        function setStatus(state, subtitle) {
+            const dot = document.getElementById("statusDot");
+            const sub = document.getElementById("statusSub");
+            if (dot) dot.className = "status-dot " + (state || "");
+            if (sub) sub.textContent = subtitle;
+        }
+
+        function buildWsUrl(baseUrl) {
+            const trimmed = baseUrl.trim().replace(/\/+$/, "");
+            if (trimmed.startsWith("wss://") || trimmed.startsWith("ws://")) {
+                return trimmed.endsWith("/ws/stream") ? trimmed : (trimmed + "/ws/stream");
+            }
+            if (trimmed.startsWith("https://")) {
+                return "wss://" + trimmed.slice("https://".length) + "/ws/stream";
+            }
+            if (trimmed.startsWith("http://")) {
+                return "ws://" + trimmed.slice("http://".length) + "/ws/stream";
+            }
+            return "wss://" + trimmed + "/ws/stream";
+        }
+
+        function connectWebSocket() {
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+            if (activeSocket) {
+                try { activeSocket.onclose = null; activeSocket.close(); } catch (e) {}
+            }
+
+            const baseUrl = getBaseUrl();
+            const wsUrl = buildWsUrl(baseUrl);
+            setStatus("", `Connecting: ${wsUrl}`);
+
+            try {
+                const ws = new WebSocket(wsUrl);
+                activeSocket = ws;
+
+                ws.onopen = function() {
+                    setStatus("connected", `Live: ${baseUrl.replace(/^https?:\/\//, '')}`);
+                };
+
+                ws.onmessage = function(event) {
+                    try {
+                        const msg = JSON.parse(event.data);
+                        if (msg.type === 'initial_state' && msg.points) {
+                            const pts = Object.values(msg.points);
+                            pts.forEach(pt => upsertMarker(pt, false));
+                            if (pts.length > 0 && autoFollow) {
+                                const last = pts[pts.length - 1];
+                                map.flyTo({ center: [ Number(last.lon), Number(last.lat) ], speed: 0.9 });
+                            }
+                        } else {
+                            upsertMarker(msg, true);
+                        }
+                    } catch (err) {
+                        console.error("Invalid WS packet:", err);
+                    }
+                };
+
+                ws.onerror = function() {
+                    setStatus("error", "Stream error - retrying...");
+                };
+
+                ws.onclose = function() {
+                    setStatus("", "Disconnected - reconnecting in 2s...");
+                    reconnectTimer = setTimeout(connectWebSocket, 2000);
+                };
+            } catch (err) {
+                setStatus("error", "Invalid WebSocket URL");
+                reconnectTimer = setTimeout(connectWebSocket, 3000);
+            }
+        }
+
+        function toggleFollow() {
+            autoFollow = !autoFollow;
+            const btn = document.getElementById("btnFollow");
+            if (btn) btn.classList.toggle("active", autoFollow);
+        }
+
+        function openSettingsModal() {
+            document.getElementById("serverUrlInput").value = getBaseUrl();
+            const sel = document.getElementById("mapStyleSelect");
+            if (sel) sel.value = currentStyleKey;
+            document.getElementById("settingsModal").classList.add("open");
+        }
+
+        function openPipeModal() {
+            document.getElementById("pipeModal").classList.add("open");
+        }
+
+        function closeModals() {
+            document.getElementById("settingsModal").classList.remove("open");
+            document.getElementById("pipeModal").classList.remove("open");
+        }
+
+        function saveServerUrl() {
+            const val = document.getElementById("serverUrlInput").value.trim() || DEFAULT_BASE_URL;
+            localStorage.setItem("pigplotter_base_url", val);
+            if (window.AndroidBridge && window.AndroidBridge.setServerUrl) {
+                window.AndroidBridge.setServerUrl(val);
+            }
+            const sel = document.getElementById("mapStyleSelect");
+            if (sel && sel.value !== currentStyleKey) {
+                setMapStyle(sel.value);
+            }
+            closeModals();
+            connectWebSocket();
+        }
+
+        function fillDeviceGps() {
+            if (window.AndroidBridge && window.AndroidBridge.requestDeviceLocation) {
+                window.AndroidBridge.requestDeviceLocation();
+            } else if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(pos => {
+                    onDeviceLocation(pos.coords.latitude, pos.coords.longitude);
+                });
+            }
+        }
+
+        window.onDeviceLocation = function(lat, lon) {
+            try {
+                const current = JSON.parse(document.getElementById("pipePayloadInput").value);
+                current.lat = Number(lat.toFixed(6));
+                current.lon = Number(lon.toFixed(6));
+                document.getElementById("pipePayloadInput").value = JSON.stringify(current, null, 2);
+            } catch (e) {
+                document.getElementById("pipePayloadInput").value = JSON.stringify({
+                    id: "android-mobile-01",
+                    lat: Number(lat.toFixed(6)),
+                    lon: Number(lon.toFixed(6)),
+                    status: "Active",
+                    notes: "Live GPS from Android"
+                }, null, 2);
+            }
+        };
+
+        async function sendPipePayload() {
+            const raw = document.getElementById("pipePayloadInput").value;
+            let parsed;
+            try {
+                parsed = JSON.parse(raw);
+            } catch (e) {
+                alert("Invalid JSON payload");
+                return;
+            }
+            const baseUrl = getBaseUrl().replace(/\/+$/, "");
+            const pipeUrl = baseUrl + "/pipe";
+
+            if (window.AndroidBridge && window.AndroidBridge.postToPipe) {
+                window.AndroidBridge.postToPipe(pipeUrl, JSON.stringify(parsed));
+                closeModals();
+                return;
+            }
+
+            try {
+                await fetch(pipeUrl, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(parsed)
+                });
+                closeModals();
+            } catch (e) {
+                alert("POST /pipe failed: " + e.message);
+            }
+        }
+
+        setMapStyle(currentStyleKey);
+        connectWebSocket();
+    </script>
+</body>
+</html>
+"""
+
+@app.get("/")
+async def serve_map_dashboard():
+    return HTMLResponse(HTML_TEMPLATE)
+
+@app.get("/points")
+async def get_latest_points():
+    return {"type": "initial_state", "points": latest_points}
+
+@app.websocket("/ws/stream")
+async def websocket_stream_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    connected_dashboards.add(websocket)
+    try:
+        if latest_points:
+            await websocket.send_text(json.dumps({
+                "type": "initial_state",
+                "points": latest_points
+            }))
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        connected_dashboards.discard(websocket)
+    except Exception:
+        connected_dashboards.discard(websocket)
+
+@app.post("/pipe")
+async def inbound_pipeline_receiver(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"status": "error", "message": "Invalid JSON format"}
+
+    lat = payload.get("lat") if payload.get("lat") is not None else payload.get("latitude")
+    lon = payload.get("lon") if payload.get("lon") is not None else (
+        payload.get("lng") if payload.get("lng") is not None else payload.get("longitude")
+    )
+    marker_id = str(payload.get("id") or payload.get("tid") or payload.get("device_id") or "node_default")
+
+    if lat is None or lon is None:
+        return {"status": "skipped", "message": "Missing coordinate values (lat/lon)"}
+
+    raw_ts = payload.get("ts")
+    if raw_ts is None:
+        ts = time.time()
+    else:
+        try:
+            ts = float(raw_ts)
+            if ts > 1e11:  # milliseconds
+                ts = ts / 1000.0
+        except Exception:
+            ts = time.time()
+
+    broadcast_packet = {
+        "marker_id": marker_id,
+        "lat": float(lat),
+        "lon": float(lon),
+        "ts": ts,
+        "full_payload": payload
+    }
+
+    latest_points[marker_id] = broadcast_packet
+
+    disconnected_clients = set()
+    for client in connected_dashboards:
+        try:
+            await client.send_text(json.dumps(broadcast_packet))
+        except Exception:
+            disconnected_clients.add(client)
+
+    for dead_client in disconnected_clients:
+        connected_dashboards.discard(dead_client)
+
+    return {"status": "dispatched", "targets_notified": len(connected_dashboards)}
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        proxy_headers=True,
+        forwarded_allow_ips="*"
+    )
